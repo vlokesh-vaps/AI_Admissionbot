@@ -4,6 +4,8 @@ A high-performance, RAG-powered (Retrieval-Augmented Generation) Admission Assis
 
 Supports seamless integration with **.NET ERP** systems via multi-tenant document upload, enforcing **strict `MI_ID` data isolation** across institutions.
 
+For a developer-oriented explanation of the code, data flow, configuration, and extension points, see [PROJECT_GUIDE.md](PROJECT_GUIDE.md).
+
 ---
 
 ## Architecture & Multi-Tenant Isolation
@@ -112,7 +114,6 @@ AI_Admissionbot/
 ---
 
 ## Quick Start
-use 
 ### 1. Prerequisites
 
 - **Python 3.10+** (Python 3.12 recommended)
@@ -144,19 +145,22 @@ use
    QDRANT_URL=http://localhost:6333
    QDRANT_COLLECTION=admission_knowledge
    DEFAULT_MI_ID=1001
+   DATABASE_URL=postgresql://username:password@host:5432/database?sslmode=require
+   DATABASE_CREATED_BY=0
    ```
 
 ---
 
 ### 3. Running the Service on Port 5003
 
-#### Option A: Run directly with Python / Uvicorn
+#### Option A: Run directly with the command hub
 ```bash
-python app.py
+python main.py api
 ```
-or
+The API is also the default command:
+
 ```bash
-uvicorn app:app --host 0.0.0.0 --port 5003 --reload
+python main.py
 ```
 The API and Web UI will be available at:
 `http://localhost:5003`
@@ -177,6 +181,14 @@ curl -X POST http://localhost:5003/api/knowledge-base/rebuild
 ```
 
 The current `embeddinggemma:latest` model returns 768-dimensional vectors. Existing Qdrant collections must use the same vector dimension and should be rebuilt after an embedding-model change.
+
+Other workflows:
+
+```bash
+python main.py chat
+python main.py build-kb
+python main.py build-kb --mi-id 1001 --no-reset
+```
 
 ---
 
@@ -214,6 +226,10 @@ Called by the .NET ERP when a user uploads a PDF or DOCX file.
 
 Returns `415` for unsupported file types, `413` for files over the configured limit, and `422` when document indexing fails.
 
+The uploaded `File` is the only accepted document source. `FilePath` is retained as ERP metadata and is never downloaded by this service.
+
+The endpoint accepts exactly two multipart fields: `File` and `MI_ID`. Requests without either field are rejected. The ERP must post the document itself as multipart form data.
+
 ### Upload a Legacy Document
 
 `POST /api/documents/upload` accepts a single `file` multipart field and indexes it under `DEFAULT_MI_ID`. This route is retained for backward compatibility; new integrations should use the tenant upload route above.
@@ -240,7 +256,7 @@ curl -X POST http://localhost:5003/api/documents/upload \
     -d "{\"conversation_id\": \"session-123\", \"question\": \"What is the fee?\", \"mi_id\": \"1001\"}"
   ```
 
-The response contains `answer`, `sources`, `escalate`, `escalation_reason`, and a `cached` flag, together with the conversation and tenant IDs.
+The response contains `answer`, `sources`, `escalate`, `escalation_reason`, and a `cached` flag, together with the conversation and tenant IDs. PostgreSQL stores one JSON array per chat turn containing only the user and assistant `role` and `content` values.
 
 ### Knowledge Base Status
 - **Endpoint:** `GET /api/knowledge-base/status?mi_id=1001`

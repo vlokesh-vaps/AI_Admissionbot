@@ -16,8 +16,9 @@ class DocumentChunk:
     metadata: dict[str, str | int]
 
 
-def _stable_id(mi_id: str, source: str, index: int, text: str) -> str:
-    digest = hashlib.sha1(f"{mi_id}:{source}:{index}:{text}".encode("utf-8")).hexdigest()[:16]
+def _stable_id(mi_id: str, source: str, index: int, text: str, aid_id: int | None = None) -> str:
+    identity = aid_id if aid_id is not None else source
+    digest = hashlib.sha1(f"{mi_id}:{identity}:{index}:{text}".encode("utf-8")).hexdigest()[:16]
     return f"{mi_id}:{source}:{index}:{digest}"
 
 
@@ -26,6 +27,7 @@ def chunk_document(
     mi_id: str | int = "default",
     max_chars: int = 1200,
     overlap_chars: int = 180,
+    aid_id: int | None = None,
 ) -> list[DocumentChunk]:
     """Split a document at paragraph/sentence boundaries while preserving overlap and tagging with tenant MI_ID."""
     mi_id_str = str(mi_id)
@@ -41,7 +43,7 @@ def chunk_document(
             return
         chunks.append(
             DocumentChunk(
-                chunk_id=_stable_id(mi_id_str, document.source_path.name, index, value),
+                chunk_id=_stable_id(mi_id_str, document.source_path.name, index, value, aid_id),
                 text=value,
                 metadata={
                     "mi_id": mi_id_str,
@@ -51,6 +53,8 @@ def chunk_document(
                 },
             )
         )
+        if aid_id is not None:
+            chunks[-1].metadata["aid_id"] = aid_id
         index += 1
 
     for paragraph in paragraphs:

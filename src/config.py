@@ -34,6 +34,8 @@ class Settings:
     qdrant_api_key: str = os.getenv("QDRANT_API_KEY", "")
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "admission_knowledge")
     default_mi_id: str = os.getenv("DEFAULT_MI_ID", "1001")
+    database_url: str = os.getenv("DATABASE_URL", "")
+    database_created_by: int = int(os.getenv("DATABASE_CREATED_BY", "0"))
 
     # Embeddings (Ollama) & Generation (Groq)
     ollama_host: str = os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -55,9 +57,7 @@ class Settings:
     # Server, Security & Limits
     api_host: str = os.getenv("HOST", os.getenv("API_HOST", "0.0.0.0"))
     api_port: int = int(os.getenv("PORT", os.getenv("API_PORT", "5003")))
-    allowed_origins: tuple[str, ...] = _csv(
-        os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8000,http://localhost:5003")
-    )
+    allowed_origins: list[str] = _csv(os.getenv("ALLOWED_ORIGINS", "*"))
     cache_ttl_seconds: int = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
     max_upload_mb: int = int(os.getenv("MAX_UPLOAD_MB", "20"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")

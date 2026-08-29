@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import json
 from pathlib import Path
 from uuid import uuid4
 import logging
+import time
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.responses import Response
 
 from src.api.schemas import (
     ChatRequest,
@@ -30,7 +33,8 @@ from src.ingestion.chunking import chunk_document
 from src.ingestion.loaders import SUPPORTED_EXTENSIONS, load_document
 from src.storage.cache import ResponseCache
 from src.storage.vector_db import VectorStore
-from src.utils.logging import configure_logging, log_event
+from src.storage.postgres import PostgresRepository
+from src.utils.logging import configure_logging, log_event, reset_request_id, safe_payload, set_request_id
 
 configure_logging(settings.log_dir, settings.log_level)
 logger = logging.getLogger(__name__)
@@ -41,6 +45,7 @@ reranker = Reranker(settings)
 conversations = ConversationStore()
 cache = ResponseCache(settings.cache_dir, settings.cache_ttl_seconds)
 rag = AdmissionRAG(settings, retriever, reranker, conversations)
+erp = PostgresRepository(settings)
 
 
 @asynccontextmanager
@@ -74,12 +79,80 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    """Attach a correlation ID and log bounded request/response details."""
+    request_id = request.headers.get("X-Request-ID") or uuid4().hex
+    request.state.request_id = request_id
+    token = set_request_id(request_id)
+    started = time.perf_counter()
+    try:
+        request_details: dict[str, object] = {
+            "method": request.method,
+            "path": request.url.path,
+            "content_type": request.headers.get("content-type"),
+        }
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                request_details["body"] = safe_payload(json.loads((await request.body()).decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                request_details["body"] = "<invalid-json>"
+        elif request.headers.get("content-type", "").startswith("multipart/form-data"):
+            request_details["body"] = "<multipart-form; file content omitted>"
+        log_event(logger, logging.INFO, "request_received", **request_details)
+
+        response = await call_next(request)
+        response_body = b""
+        async for chunk in response.body_iterator:
+            response_body += chunk
+        response_details: object = None
+        if response_body and "application/json" in response.headers.get("content-type", ""):
+            try:
+                response_details = safe_payload(json.loads(response_body.decode("utf-8")))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                response_details = "<invalid-json-response>"
+        elif response_body:
+            response_details = f"<{len(response_body)} response bytes>"
+        log_event(
+            logger,
+            logging.INFO,
+            "response_sent",
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+            body=response_details,
+        )
+        response.headers["X-Request-ID"] = request_id
+        headers = {key: value for key, value in response.headers.items() if key.lower() != "content-length"}
+        return Response(
+            content=response_body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type,
+            background=response.background,
+        )
+    finally:
+        reset_request_id(token)
+
 _MAX_UPLOAD_BYTES = settings.max_upload_mb * 1024 * 1024
 
 
 @app.exception_handler(Exception)
 async def _global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("unhandled_error on %s %s", request.method, request.url.path)
+    log_event(
+        logger,
+        logging.ERROR,
+        "request_failed",
+        request_id=getattr(request.state, "request_id", None),
+        method=request.method,
+        path=request.url.path,
+    )
+    logger.exception(
+        "request_failed_exception",
+        extra={"event": "request_failed_exception", "structured": {"request_id": getattr(request.state, "request_id", None)}},
+    )
     return JSONResponse(status_code=500, content={"detail": "An internal error occurred."})
 
 
@@ -92,6 +165,37 @@ def _serialize_result(result: object, cached: bool = False) -> ChatResponse:
         escalate=result.escalate,  # type: ignore[attr-defined]
         escalation_reason=result.escalation_reason,  # type: ignore[attr-defined]
         cached=cached,
+    )
+
+
+def _save_chat_message(mi_id: str, session_id: str, message: object) -> None:
+    if not settings.database_url:
+        return
+    try:
+        erp.save_message(int(mi_id), session_id, message)
+    except Exception:
+        log_event(
+            logger,
+            logging.ERROR,
+            "conversation_message_save_failed",
+            operation="insert",
+            table="AI_Admission_Conversation",
+            mi_id=mi_id,
+            session_id=session_id,
+        )
+        logger.exception("conversation_message_save_exception")
+        raise RuntimeError("AI_Admission_Conversation insert failed.") from None
+
+
+def _persist_chat_turn(mi_id: str, session_id: str, question: str, answer: str) -> None:
+    """Persist one row containing the user message and assistant reply."""
+    _save_chat_message(
+        mi_id,
+        session_id,
+        [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": answer},
+        ],
     )
 
 
@@ -116,8 +220,8 @@ def health() -> dict:
 
 @app.post("/api/ai/admission/document", response_model=TenantDocumentUploadResponse)
 async def upload_admission_document(
-    MI_ID: str = Form(..., description="Unique Tenant Identifier (e.g. 1001)"),
     File: UploadFile = File(..., description="PDF or DOCX document"),
+    MI_ID: str = Form(..., description="Unique Tenant Identifier (e.g. 1001)"),
 ) -> TenantDocumentUploadResponse:
     """Multi-tenant document upload endpoint called by the .NET ERP.
 
@@ -158,7 +262,15 @@ async def upload_admission_document(
         retriever.refresh()
     except Exception as exc:
         destination.unlink(missing_ok=True)
-        logger.exception("tenant_document_index_failed", extra={"structured": {"mi_id": mi_id_clean, "filename": filename}})
+        log_event(
+            logger,
+            logging.ERROR,
+            "document_index_failed",
+            operation="ingest",
+            mi_id=mi_id_clean,
+            filename=filename,
+        )
+        logger.exception("document_index_exception")
         raise HTTPException(status_code=422, detail=f"Document could not be indexed: {exc}") from exc
 
     log_event(
@@ -208,7 +320,7 @@ async def upload_document_legacy(file: UploadFile = File(...)) -> UploadResponse
         logger.exception("document_index_failed")
         raise HTTPException(status_code=422, detail=f"Document could not be indexed: {exc}") from exc
 
-    log_event(logger, logging.INFO, "document_indexed", filename=filename, chunks=indexed)
+    log_event(logger, logging.INFO, "document_indexed", operation="ingest", filename=filename, chunks=indexed, mi_id=settings.default_mi_id)
     return UploadResponse(
         filename=filename,
         stored_path=str(destination),
@@ -222,10 +334,42 @@ def chat(request: ChatRequest) -> ChatResponse:
     """Query the admission chatbot strictly within the applicant's tenant knowledge base."""
     target_mi_id = str(request.mi_id or settings.default_mi_id).strip()
     cache_key = f"{target_mi_id}:{request.conversation_id}"
+    log_event(
+        logger,
+        logging.INFO,
+        "chat_request",
+        operation="answer",
+        mi_id=target_mi_id,
+        session_id=request.conversation_id,
+    )
 
     cached_value = cache.get(cache_key, request.question)
     if cached_value:
-        return ChatResponse(**cached_value, cached=True)
+        log_event(
+            logger,
+            logging.INFO,
+            "cache_hit",
+            operation="answer",
+            mi_id=target_mi_id,
+            session_id=request.conversation_id,
+            source="cache",
+        )
+        cached_response = dict(cached_value)
+        cached_response["cached"] = True
+        response = ChatResponse(**cached_response)
+        _persist_chat_turn(target_mi_id, request.conversation_id, request.question, response.answer)
+        log_event(
+            logger,
+            logging.INFO,
+            "chat_completed",
+            operation="answer",
+            mi_id=target_mi_id,
+            session_id=request.conversation_id,
+            source_count=len(response.sources),
+            escalate=response.escalate,
+            cached=True,
+        )
+        return response
 
     try:
         result = rag.chat(
@@ -238,11 +382,24 @@ def chat(request: ChatRequest) -> ChatResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        logger.exception("chat_failed", extra={"structured": {"mi_id": target_mi_id}})
+        log_event(logger, logging.ERROR, "chat_failed", operation="answer", mi_id=target_mi_id)
+        logger.exception("chat_exception")
         raise HTTPException(status_code=500, detail="Unable to answer the question.") from exc
 
     response = _serialize_result(result)
     cache.set(cache_key, request.question, response.model_dump())
+    _persist_chat_turn(target_mi_id, request.conversation_id, request.question, response.answer)
+    log_event(
+        logger,
+        logging.INFO,
+        "chat_completed",
+        operation="answer",
+        mi_id=target_mi_id,
+        session_id=request.conversation_id,
+        source_count=len(response.sources),
+        escalate=response.escalate,
+        cached=False,
+    )
     return response
 
 
@@ -285,10 +442,8 @@ def escalation(request: EscalationRequest) -> EscalationResponse:
         logger,
         logging.INFO,
         "human_escalation_requested",
+        operation="escalation",
         conversation_id=request.conversation_id,
-        applicant_name=request.applicant_name,
-        applicant_email=request.applicant_email,
-        note=request.note,
         mi_id=request.mi_id,
     )
     return EscalationResponse(

@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from unittest.mock import patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -47,3 +48,36 @@ def test_escalation_endpoint() -> None:
     data = response.json()
     assert data["accepted"] is True
     assert data["conversation_id"] == "test-conv"
+
+
+def test_chat_cache_hit_does_not_duplicate_cached_field() -> None:
+    if client is None:
+        pytest.skip("python-multipart is not installed.")
+
+    cached_response = {
+        "conversation_id": "session-cache",
+        "answer": "Cached answer",
+        "mi_id": "30",
+        "sources": [],
+        "escalate": False,
+        "escalation_reason": None,
+        "cached": False,
+    }
+    with patch("src.api.app.cache.get", return_value=cached_response), patch("src.api.app.erp.save_message") as save_message:
+        response = client.post(
+            "/api/chat",
+            json={
+                "conversation_id": "session-cache",
+                "question": "Where can I find the online admission form?",
+                "mi_id": "30",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["cached"] is True
+    save_message.assert_called_once()
+    stored_message = save_message.call_args.args[2]
+    assert stored_message == [
+        {"role": "user", "content": "Where can I find the online admission form?"},
+        {"role": "assistant", "content": "Cached answer"},
+    ]
