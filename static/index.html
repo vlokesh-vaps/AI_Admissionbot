@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admission AI Assistant | Knowledge-Base RAG Portal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-primary: #0b0f19;
+      --bg-surface: #131b2e;
+      --bg-surface-elevated: #1e293b;
+      --accent: #3b82f6;
+      --accent-gradient: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --border-color: rgba(255, 255, 255, 0.08);
+      --success: #10b981;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --radius-sm: 8px;
+      --radius-md: 14px;
+      --radius-lg: 20px;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: var(--bg-primary);
+      color: var(--text-main);
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    header {
+      background: rgba(19, 27, 46, 0.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-color);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 10;
+    }
+
+    .brand-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.25rem;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--accent-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .brand-badge {
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      -webkit-text-fill-color: #60a5fa;
+    }
+
+    .kb-status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      background: var(--bg-surface-elevated);
+      padding: 6px 14px;
+      border-radius: 999px;
+      border: 1px solid var(--border-color);
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background-color: var(--success);
+      box-shadow: 0 0 8px var(--success);
+    }
+
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    .chat-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      height: 100%;
+      position: relative;
+    }
+
+    .messages-view {
+      flex: 1;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .message-row {
+      display: flex;
+      gap: 12px;
+      max-width: 85%;
+      animation: fadeIn 0.25s ease forwards;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .message-row.user {
+      align-self: flex-end;
+      flex-direction: row-reverse;
+    }
+
+    .avatar {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.85rem;
+      font-weight: 600;
+      flex-shrink: 0;
+    }
+
+    .avatar.assistant {
+      background: var(--accent-gradient);
+      color: white;
+    }
+
+    .avatar.user {
+      background: #475569;
+      color: white;
+    }
+
+    .bubble {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-md);
+      padding: 14px 18px;
+      font-size: 0.95rem;
+      line-height: 1.6;
+    }
+
+    .message-row.user .bubble {
+      background: #2563eb;
+      border-color: #3b82f6;
+      color: #ffffff;
+    }
+
+    .sources-container {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-color);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .source-tag {
+      font-size: 0.75rem;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border-color);
+      padding: 3px 8px;
+      border-radius: 4px;
+      color: #94a3b8;
+    }
+
+    .escalation-banner {
+      margin-top: 10px;
+      padding: 10px 14px;
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      border-radius: var(--radius-sm);
+      color: #fbbf24;
+      font-size: 0.85rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .quick-prompts {
+      padding: 12px 24px;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      background: rgba(19, 27, 46, 0.5);
+      border-top: 1px solid var(--border-color);
+    }
+
+    .prompt-chip {
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-color);
+      color: var(--text-muted);
+      padding: 6px 14px;
+      border-radius: 999px;
+      font-size: 0.82rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+
+    .prompt-chip:hover {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+
+    .input-bar-container {
+      padding: 18px 24px;
+      background: var(--bg-surface);
+      border-top: 1px solid var(--border-color);
+    }
+
+    .input-wrapper {
+      display: flex;
+      gap: 10px;
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius-lg);
+      padding: 6px 8px 6px 18px;
+      align-items: center;
+    }
+
+    .input-wrapper:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+    }
+
+    .input-wrapper input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      outline: none;
+      color: var(--text-main);
+      font-size: 0.95rem;
+    }
+
+    .send-btn {
+      background: var(--accent-gradient);
+      border: none;
+      color: white;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+
+    .send-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .typing-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 12px;
+    }
+
+    .typing-dot {
+      width: 6px;
+      height: 6px;
+      background: #94a3b8;
+      border-radius: 50%;
+      animation: bounce 1.4s infinite ease-in-out both;
+    }
+
+    .typing-dot:nth-child(1) { animation-delay: -0.32s; }
+    .typing-dot:nth-child(2) { animation-delay: -0.16s; }
+
+    @keyframes bounce {
+      0%, 80%, 100% { transform: scale(0); }
+      40% { transform: scale(1.0); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand-title">
+      Admission AI Assistant
+      <span class="brand-badge">RAG Powered</span>
+    </div>
+    <div class="kb-status" id="kbStatus">
+      <span class="status-dot"></span>
+      <span id="kbText">Connecting to Knowledge Base...</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="chat-container">
+      <div class="messages-view" id="messagesView">
+        <div class="message-row assistant">
+          <div class="avatar assistant">AI</div>
+          <div class="bubble">
+            Hello! I am the official Admissions Assistant. How can I assist you with course offerings, eligibility criteria, admission deadlines, or fee structures today?
+          </div>
+        </div>
+      </div>
+
+      <div class="quick-prompts">
+        <button class="prompt-chip" onclick="sendPrompt('What courses and programs are offered?')">Programs & Courses</button>
+        <button class="prompt-chip" onclick="sendPrompt('What is the eligibility criteria for admission?')">Eligibility Criteria</button>
+        <button class="prompt-chip" onclick="sendPrompt('What are the fee details and payment schedules?')">Fee Structure</button>
+        <button class="prompt-chip" onclick="sendPrompt('What is the step-by-step application procedure?')">Application Steps</button>
+        <button class="prompt-chip" onclick="sendPrompt('I would like to speak to an admissions counselor.')">Counselor Support</button>
+      </div>
+
+      <div class="input-bar-container">
+        <form class="input-wrapper" id="chatForm" onsubmit="handleSubmit(event)">
+          <input type="text" id="userInput" placeholder="Ask any question regarding admissions..." autocomplete="off">
+          <button type="submit" class="send-btn" id="sendBtn">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+          </button>
+        </form>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const conversationId = "conv-" + Math.random().toString(36).substring(2, 10);
+    const messagesView = document.getElementById("messagesView");
+    const userInput = document.getElementById("userInput");
+    const sendBtn = document.getElementById("sendBtn");
+
+    async function checkStatus() {
+      try {
+        const res = await fetch("/api/knowledge-base/status");
+        if (res.ok) {
+          const data = await res.json();
+          document.getElementById("kbText").textContent = `${data.document_count} Documents (${data.chunk_count} chunks indexed)`;
+        }
+      } catch {
+        document.getElementById("kbText").textContent = "Service Online";
+      }
+    }
+    checkStatus();
+
+    function appendMessage(role, text, sources = [], escalate = false, reason = "") {
+      const row = document.createElement("div");
+      row.className = `message-row ${role}`;
+
+      const avatar = document.createElement("div");
+      avatar.className = `avatar ${role}`;
+      avatar.textContent = role === "user" ? "You" : "AI";
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = text;
+
+      if (sources && sources.length > 0) {
+        const sc = document.createElement("div");
+        sc.className = "sources-container";
+        sources.forEach((s, idx) => {
+          const tag = document.createElement("span");
+          tag.className = "source-tag";
+          tag.textContent = `[Source ${idx + 1}] ${s.source || s.title || 'Document'}`;
+          sc.appendChild(tag);
+        });
+        bubble.appendChild(sc);
+      }
+
+      if (escalate) {
+        const esc = document.createElement("div");
+        esc.className = "escalation-banner";
+        esc.innerHTML = `<span><strong>Note:</strong> ${reason || 'Human counselor follow-up recommended.'}</span>`;
+        bubble.appendChild(esc);
+      }
+
+      row.appendChild(avatar);
+      row.appendChild(bubble);
+      messagesView.appendChild(row);
+      messagesView.scrollTop = messagesView.scrollHeight;
+    }
+
+    function appendTyping() {
+      const row = document.createElement("div");
+      row.className = "message-row assistant";
+      row.id = "typingRow";
+
+      const avatar = document.createElement("div");
+      avatar.className = "avatar assistant";
+      avatar.textContent = "AI";
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.innerHTML = '<div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>';
+
+      row.appendChild(avatar);
+      row.appendChild(bubble);
+      messagesView.appendChild(row);
+      messagesView.scrollTop = messagesView.scrollHeight;
+    }
+
+    function removeTyping() {
+      const el = document.getElementById("typingRow");
+      if (el) el.remove();
+    }
+
+    async function sendPrompt(text) {
+      userInput.value = text;
+      await processChat(text);
+    }
+
+    async function handleSubmit(e) {
+      e.preventDefault();
+      const text = userInput.value.trim();
+      if (!text) return;
+      await processChat(text);
+    }
+
+    async function processChat(text) {
+      userInput.value = "";
+      sendBtn.disabled = true;
+      appendMessage("user", text);
+      appendTyping();
+
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ conversation_id: conversationId, question: text })
+        });
+        removeTyping();
+        if (!res.ok) {
+          const err = await res.json();
+          appendMessage("assistant", err.detail || "Unable to retrieve information at this time.");
+        } else {
+          const data = await res.json();
+          appendMessage("assistant", data.answer, data.sources, data.escalate, data.escalation_reason);
+        }
+      } catch (err) {
+        removeTyping();
+        appendMessage("assistant", "Network error. Please make sure the service is running.");
+      } finally {
+        sendBtn.disabled = false;
+        userInput.focus();
+      }
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+services:
+  # --- Admission Chatbot (RAG + Knowledge Base & Ingestion API) ---
+  admission-chatbot:
+    build: .
+    ports:
+      - "5003:5003"
+    env_file: .env
+    environment:
+      PORT: 5003
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_EMBED_MODEL: embeddinggemma:latest
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: admission_knowledge
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      ollama:
+        condition: service_started
+      qdrant:
+        condition: service_started
+    restart: unless-stopped
+
+  # --- Ollama Embedding Server ---
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./data/models/ollama:/root/.ollama
+    restart: unless-stopped
+
+  # --- Qdrant Vector Database ---
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant_data:/qdrant/storage
+    restart: unless-stopped
