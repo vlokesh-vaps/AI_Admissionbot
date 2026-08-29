@@ -78,7 +78,7 @@ class PostgresRepository:
         log_event(
             logger,
             logging.INFO,
-            "conversation_message_saved",
+            "conversation_saved",
             operation="insert",
             table="AI_Admission_Conversation",
             mi_id=mi_id,

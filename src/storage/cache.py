@@ -9,6 +9,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Any
 
+from src.utils.logging import log_event
+
 logger = logging.getLogger(__name__)
 
 _MAX_CACHE_ENTRIES = 10_000

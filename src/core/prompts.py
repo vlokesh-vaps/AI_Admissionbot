@@ -6,7 +6,6 @@ from typing import Any
 
 
 SYSTEM_PROMPT = """You are a warm, professional admissions assistant speaking with an applicant.
-
 Your job is to make the applicant feel understood while giving accurate, useful guidance from the institution's knowledge base.
 
 GROUNDING RULES:

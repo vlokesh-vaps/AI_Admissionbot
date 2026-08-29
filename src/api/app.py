@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import json
 from pathlib import Path
 from uuid import uuid4
 import logging
@@ -12,7 +11,6 @@ import time
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from starlette.responses import Response
 
 from src.api.schemas import (
     ChatRequest,
@@ -34,7 +32,7 @@ from src.ingestion.loaders import SUPPORTED_EXTENSIONS, load_document
 from src.storage.cache import ResponseCache
 from src.storage.vector_db import VectorStore
 from src.storage.postgres import PostgresRepository
-from src.utils.logging import configure_logging, log_event, reset_request_id, safe_payload, set_request_id
+from src.utils.logging import configure_logging, log_event, reset_request_id, set_request_id
 
 configure_logging(settings.log_dir, settings.log_level)
 logger = logging.getLogger(__name__)
@@ -82,57 +80,24 @@ app.add_middleware(
 
 @app.middleware("http")
 async def request_logging(request: Request, call_next):
-    """Attach a correlation ID and log bounded request/response details."""
+    """Attach a correlation ID and emit one concise request completion event."""
     request_id = request.headers.get("X-Request-ID") or uuid4().hex
     request.state.request_id = request_id
     token = set_request_id(request_id)
     started = time.perf_counter()
     try:
-        request_details: dict[str, object] = {
-            "method": request.method,
-            "path": request.url.path,
-            "content_type": request.headers.get("content-type"),
-        }
-        if request.headers.get("content-type", "").startswith("application/json"):
-            try:
-                request_details["body"] = safe_payload(json.loads((await request.body()).decode("utf-8")))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                request_details["body"] = "<invalid-json>"
-        elif request.headers.get("content-type", "").startswith("multipart/form-data"):
-            request_details["body"] = "<multipart-form; file content omitted>"
-        log_event(logger, logging.INFO, "request_received", **request_details)
-
         response = await call_next(request)
-        response_body = b""
-        async for chunk in response.body_iterator:
-            response_body += chunk
-        response_details: object = None
-        if response_body and "application/json" in response.headers.get("content-type", ""):
-            try:
-                response_details = safe_payload(json.loads(response_body.decode("utf-8")))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                response_details = "<invalid-json-response>"
-        elif response_body:
-            response_details = f"<{len(response_body)} response bytes>"
         log_event(
             logger,
             logging.INFO,
-            "response_sent",
+            "request_completed",
             method=request.method,
             path=request.url.path,
-            status_code=response.status_code,
+            status=response.status_code,
             duration_ms=round((time.perf_counter() - started) * 1000, 2),
-            body=response_details,
         )
         response.headers["X-Request-ID"] = request_id
-        headers = {key: value for key, value in response.headers.items() if key.lower() != "content-length"}
-        return Response(
-            content=response_body,
-            status_code=response.status_code,
-            headers=headers,
-            media_type=response.media_type,
-            background=response.background,
-        )
+        return response
     finally:
         reset_request_id(token)
 
@@ -148,10 +113,8 @@ async def _global_exception_handler(request: Request, exc: Exception) -> JSONRes
         request_id=getattr(request.state, "request_id", None),
         method=request.method,
         path=request.url.path,
-    )
-    logger.exception(
-        "request_failed_exception",
-        extra={"event": "request_failed_exception", "structured": {"request_id": getattr(request.state, "request_id", None)}},
+        error_type=type(exc).__name__,
+        exc_info=True,
     )
     return JSONResponse(status_code=500, content={"detail": "An internal error occurred."})
 
@@ -174,16 +137,7 @@ def _save_chat_message(mi_id: str, session_id: str, message: object) -> None:
     try:
         erp.save_message(int(mi_id), session_id, message)
     except Exception:
-        log_event(
-            logger,
-            logging.ERROR,
-            "conversation_message_save_failed",
-            operation="insert",
-            table="AI_Admission_Conversation",
-            mi_id=mi_id,
-            session_id=session_id,
-        )
-        logger.exception("conversation_message_save_exception")
+        log_event(logger, logging.ERROR, "conversation_save_failed", operation="insert", table="AI_Admission_Conversation", mi_id=mi_id, session_id=session_id, error_type="database_error", exc_info=True)
         raise RuntimeError("AI_Admission_Conversation insert failed.") from None
 
 
@@ -262,21 +216,13 @@ async def upload_admission_document(
         retriever.refresh()
     except Exception as exc:
         destination.unlink(missing_ok=True)
-        log_event(
-            logger,
-            logging.ERROR,
-            "document_index_failed",
-            operation="ingest",
-            mi_id=mi_id_clean,
-            filename=filename,
-        )
-        logger.exception("document_index_exception")
+        log_event(logger, logging.ERROR, "document_index_failed", operation="ingest", mi_id=mi_id_clean, filename=filename, error_type=type(exc).__name__, exc_info=True)
         raise HTTPException(status_code=422, detail=f"Document could not be indexed: {exc}") from exc
 
     log_event(
         logger,
         logging.INFO,
-        "tenant_document_indexed",
+        "document_indexed",
         mi_id=mi_id_clean,
         filename=filename,
         chunks=indexed,
@@ -290,42 +236,6 @@ async def upload_admission_document(
         stored_path=str(destination),
         indexed_chunks=indexed,
         message="Document successfully processed and indexed into tenant knowledge base.",
-    )
-
-
-@app.post("/api/documents/upload", response_model=UploadResponse)
-async def upload_document_legacy(file: UploadFile = File(...)) -> UploadResponse:
-    """Legacy single-tenant upload endpoint for backward compatibility."""
-    filename = Path(file.filename or "").name
-    suffix = Path(filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise HTTPException(status_code=415, detail="Only PDF and DOCX files are supported.")
-
-    data = await file.read()
-    if len(data) > _MAX_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum upload size is {settings.max_upload_mb} MB.",
-        )
-
-    destination = settings.documents_dir / f"{uuid4().hex}_{filename}"
-    destination.write_bytes(data)
-    try:
-        document = load_document(destination)
-        chunks = chunk_document(document, mi_id=settings.default_mi_id)
-        indexed = store.upsert(chunks, mi_id=settings.default_mi_id)
-        retriever.refresh()
-    except Exception as exc:
-        destination.unlink(missing_ok=True)
-        logger.exception("document_index_failed")
-        raise HTTPException(status_code=422, detail=f"Document could not be indexed: {exc}") from exc
-
-    log_event(logger, logging.INFO, "document_indexed", operation="ingest", filename=filename, chunks=indexed, mi_id=settings.default_mi_id)
-    return UploadResponse(
-        filename=filename,
-        stored_path=str(destination),
-        indexed_chunks=indexed,
-        mi_id=settings.default_mi_id,
     )
 
 
@@ -382,8 +292,7 @@ def chat(request: ChatRequest) -> ChatResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
-        log_event(logger, logging.ERROR, "chat_failed", operation="answer", mi_id=target_mi_id)
-        logger.exception("chat_exception")
+        log_event(logger, logging.ERROR, "chat_failed", operation="answer", mi_id=target_mi_id, error_type=type(exc).__name__, exc_info=True)
         raise HTTPException(status_code=500, detail="Unable to answer the question.") from exc
 
     response = _serialize_result(result)

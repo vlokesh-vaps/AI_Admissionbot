@@ -12,9 +12,6 @@ from datetime import datetime, timezone
 
 
 _request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
-_REDACTED = "[REDACTED]"
-_SENSITIVE_KEYS = {"password", "passwd", "secret", "token", "api_key", "authorization", "database_url"}
-_MAX_PAYLOAD_CHARS = 4000
 
 
 def set_request_id(value: str | None) -> object:
@@ -26,31 +23,11 @@ def reset_request_id(token: object) -> None:
     _request_id.reset(token)  # type: ignore[arg-type]
 
 
-def safe_payload(value: Any) -> Any:
-    """Return a bounded log-safe copy of a request or response payload."""
-    def clean(item: Any, key: str = "") -> Any:
-        if key.lower() in _SENSITIVE_KEYS or any(marker in key.lower() for marker in ("password", "api-key", "access_token")):
-            return _REDACTED
-        if isinstance(item, dict):
-            return {str(child_key): clean(child_value, str(child_key)) for child_key, child_value in item.items()}
-        if isinstance(item, (list, tuple)):
-            return [clean(child) for child in item]
-        if isinstance(item, bytes):
-            return f"<binary:{len(item)} bytes>"
-        return item
-
-    cleaned = clean(value)
-    text = json.dumps(cleaned, ensure_ascii=True, default=str)
-    if len(text) > _MAX_PAYLOAD_CHARS:
-        return f"{text[:_MAX_PAYLOAD_CHARS]}...[truncated]"
-    return cleaned
-
-
 class ReadableFormatter(logging.Formatter):
     """Format structured records as compact, human-readable single lines."""
 
     def format(self, record: logging.LogRecord) -> str:
-        timestamp = datetime.fromtimestamp(record.created, timezone.utc).strftime("%H:%M:%S")
+        timestamp = datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
         event = str(getattr(record, "event", record.getMessage())).upper()
         fields: dict[str, Any] = {}
         request_id = _request_id.get()
@@ -73,20 +50,20 @@ class ReadableFormatter(logging.Formatter):
                 rendered = f'"{str(value).replace(chr(34), chr(92) + chr(34))}"'
             values.append(f"{key}={rendered}")
 
-        line = f"[{timestamp}] [{record.levelname}] {event}"
+        line = f"{timestamp} | {record.levelname} | {event}"
         if values:
-            line += " " + " ".join(values)
+            line += " | " + " ".join(values)
         if record.exc_info:
             exception_text = str(record.exc_info[1]).replace("\r", " ").replace("\n", " | ")
             if len(exception_text) > 1000:
                 exception_text = exception_text[:1000] + "...[truncated]"
             exception_text = exception_text.replace(chr(34), chr(92) + chr(34))
-            line += f" exception_type=\"{record.exc_info[0].__name__}\" exception=\"{exception_text}\""
+            line += f" | exception_type=\"{record.exc_info[0].__name__}\" exception=\"{exception_text}\""
         return line
 
 
 def configure_logging(log_dir: Path, log_level: str = "INFO") -> logging.Logger:
-    """Configure console and JSON-lines file logging."""
+    """Configure console and readable file logging."""
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "chat.log"
 
@@ -108,13 +85,13 @@ def configure_logging(log_dir: Path, log_level: str = "INFO") -> logging.Logger:
     root_logger.addHandler(file_handler)
 
     # Suppress verbose third-party loggers
-    for noisy in ("urllib3", "httpx", "httpcore", "qdrant_client", "openai"):
+    for noisy in ("urllib3", "httpx", "httpx2", "httpcore", "qdrant_client", "openai", "uvicorn.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     return root_logger
 
 
-def log_event(logger: logging.Logger, level: int, event_name: str, **kwargs: Any) -> None:
+def log_event(logger: logging.Logger, level: int, event_name: str, *, exc_info: Any = None, **kwargs: Any) -> None:
     """Emit a consistently shaped structured event log."""
     extra = {"event": event_name, "structured": kwargs}
-    logger.log(level, event_name, extra=extra)
+    logger.log(level, event_name, extra=extra, exc_info=exc_info)

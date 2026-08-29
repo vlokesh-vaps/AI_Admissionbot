@@ -10,7 +10,7 @@ from src.config import settings
 from src.ingestion.chunking import chunk_document
 from src.ingestion.loaders import SUPPORTED_EXTENSIONS, load_document, load_documents
 from src.storage.vector_db import VectorStore
-from src.utils.logging import configure_logging
+from src.utils.logging import configure_logging, log_event
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def build_knowledge_base(reset: bool = True, mi_id: str | None = None) -> int:
                     all_chunks.extend(chunk_document(doc, mi_id=tenant_id))
 
     indexed = store.upsert(all_chunks) if all_chunks else 0
-    logger.info("knowledge_base_built", extra={"structured": {"chunks": indexed, "mi_id": mi_id or "all"}})
+    log_event(logger, logging.INFO, "knowledge_base_built", operation="rebuild", chunks=indexed, mi_id=mi_id or "all")
     return indexed
 
 

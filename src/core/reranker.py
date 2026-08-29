@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from src.config import Settings
+from src.utils.logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,8 @@ class Reranker:
             self.model = CrossEncoder(settings.reranker_model)
             self._mode = "cross-encoder"
         except Exception as exc:  # pragma: no cover - depends on local model availability
-            logger.warning("Cross-encoder unavailable; using lexical reranking: %s", exc)
-        logger.info("Reranker initialized in '%s' mode", self._mode)
+            log_event(logger, logging.WARNING, "reranker_fallback", operation="initialize", mode="lexical", error_type=type(exc).__name__)
+        log_event(logger, logging.INFO, "reranker_initialized", operation="initialize", mode=self._mode)
 
     @property
     def mode(self) -> str:

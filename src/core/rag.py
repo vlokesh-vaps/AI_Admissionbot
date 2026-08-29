@@ -15,6 +15,7 @@ from src.core.conversation import ConversationStore
 from src.core.prompts import SYSTEM_PROMPT, build_context, build_user_prompt
 from src.core.reranker import Reranker
 from src.core.retrievers import HybridRetriever
+from src.utils.logging import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -99,21 +100,15 @@ class AdmissionRAG:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status in _TRANSIENT_STATUS_CODES and attempt < _MAX_RETRIES:
                     delay = _RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "Groq transient error (status=%s, attempt=%d/%d), retrying in %.1fs",
-                        status, attempt + 1, _MAX_RETRIES, delay,
-                    )
+                    log_event(logger, logging.WARNING, "llm_retry", operation="generate", status=status, attempt=attempt + 1, max_retries=_MAX_RETRIES, delay_ms=round(delay * 1000))
                     time.sleep(delay)
                     continue
                 raise
         raise RuntimeError("Groq call failed after retries") from last_exc  # pragma: no cover
 
-    def chat(
-        self,
-        conversation_id: str,
+    def chat( self, conversation_id: str,
         question: str,
-        mi_id: str | int | None = None,
-    ) -> ChatResult:
+        mi_id: str | int | None = None, ) -> ChatResult:
         if not question.strip():
             raise ValueError("Question must not be empty.")
         if not self.settings.groq_api_key:
@@ -145,16 +140,15 @@ class AdmissionRAG:
             }
             for item in ranked
         ]
-        logger.info(
-            "chat_completed",
-            extra={
-                "structured": {
-                    "conversation_id": conversation_id,
-                    "mi_id": target_mi_id,
-                    "retrieved_candidates": len(candidates),
-                    "returned_sources": len(sources),
-                    "escalate": escalate,
-                }
-            },
+        log_event(
+            logger,
+            logging.INFO,
+            "rag_completed",
+            operation="retrieve_generate",
+            conversation_id=conversation_id,
+            mi_id=target_mi_id,
+            retrieved_candidates=len(candidates),
+            returned_sources=len(sources),
+            escalate=escalate,
         )
         return ChatResult(answer, conversation_id, sources, escalate, reason, mi_id=target_mi_id)

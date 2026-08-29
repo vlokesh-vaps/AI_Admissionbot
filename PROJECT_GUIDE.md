@@ -107,3 +107,80 @@ python -m pytest -q            # Run tests
 The UI is available at `http://localhost:5003`; OpenAPI documentation is available at `http://localhost:5003/docs`.
 
 Tests use isolated or mocked dependencies and do not require the production PostgreSQL, Groq, or Qdrant services.
+
+
+• mi_id filtering happens in these locations:
+
+  1. API receives mi_id
+     src/api/app.py:245
+
+     target_mi_id = str(request.mi_id or settings.default_mi_id).strip()
+
+  2. RAG passes it to the retriever
+     src/core/rag.py:119
+
+     candidates = self.retriever.search(question, mi_id=target_mi_id)
+
+  3. Hybrid retriever filters tenant chunks
+     src/core/retrievers.py:58
+
+     semantic = self.store.search(
+         query=query,
+         mi_id=mi_id_str,
+         limit=limit * 2,
+     )
+
+     BM25 filtering is here:
+
+     src/core/retrievers.py:80
+
+     tenant_chunks = [
+         chunk for chunk in self._chunks
+         if str(
+             chunk.get("mi_id")
+             or chunk.get("metadata", {}).get("mi_id", "")
+         ).strip() == mi_id_str
+     ]
+
+  4. Actual Qdrant/vector database filter
+     src/storage/vector_db.py:209
+
+     tenant_filter = models.Filter(
+         must=[
+             models.FieldCondition(
+                 key="mi_id",
+                 match=models.MatchValue(value=mi_id_str),
+             )
+         ]
+     )
+
+     It is applied here:
+
+     src/storage/vector_db.py:218
+
+     response = self.client.query_points(
+         collection_name=self.collection_name,
+         query=query_embedding,
+         query_filter=tenant_filter,
+         limit=limit,
+         with_payload=True,
+     )
+
+  5. mi_id is stored in every indexed chunk
+     src/ingestion/chunking.py:48
+
+     metadata={
+         "mi_id": mi_id_str,
+         ...
+     }
+
+  So the retrieval flow is:
+
+  Chat request mi_id
+      -> app.py
+      -> rag.py
+      -> retrievers.py
+      -> vector_db.py
+      -> Qdrant filter key="mi_id"
+
+  Example: a request with mi_id="30" can retrieve only documents indexed with mi_id="30".
