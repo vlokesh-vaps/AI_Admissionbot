@@ -7,8 +7,8 @@ import logging
 from pathlib import Path
 
 from src.config import settings
-from src.ingestion.chunking import chunk_document
-from src.ingestion.loaders import SUPPORTED_EXTENSIONS, load_document, load_documents
+from src.ingestion.chunking import chunk_documents
+from src.ingestion.loaders import SUPPORTED_EXTENSIONS, load_document
 from src.storage.vector_db import VectorStore
 from src.utils.logging import configure_logging, log_event
 
@@ -28,22 +28,28 @@ def build_knowledge_base(reset: bool = True, mi_id: str | None = None) -> int:
     all_chunks = []
     if mi_id:
         target_dir = settings.tenant_documents_dir(mi_id)
-        docs = [load_document(p) for p in sorted(target_dir.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
-        for doc in docs:
-            all_chunks.extend(chunk_document(doc, mi_id=mi_id))
+        docs = []
+        for p in sorted(target_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                docs.append(load_document(p))
+        all_chunks = chunk_documents(docs, mi_id=mi_id)
     else:
         # Load root documents
-        root_docs = [load_document(p) for p in sorted(settings.documents_dir.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
-        for doc in root_docs:
-            all_chunks.extend(chunk_document(doc, mi_id=settings.default_mi_id))
+        root_docs = []
+        for p in sorted(settings.documents_dir.iterdir()):
+            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                root_docs.append(load_document(p))
+        all_chunks = chunk_documents(root_docs, mi_id=settings.default_mi_id)
 
         # Load tenant subdirectories
         for tenant_dir in sorted(settings.documents_dir.iterdir()):
             if tenant_dir.is_dir():
                 tenant_id = tenant_dir.name
-                tenant_docs = [load_document(p) for p in sorted(tenant_dir.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS]
-                for doc in tenant_docs:
-                    all_chunks.extend(chunk_document(doc, mi_id=tenant_id))
+                tenant_docs = []
+                for p in sorted(tenant_dir.iterdir()):
+                    if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                        tenant_docs.append(load_document(p))
+                all_chunks.extend(chunk_documents(tenant_docs, mi_id=tenant_id))
 
     indexed = store.upsert(all_chunks) if all_chunks else 0
     log_event(logger, logging.INFO, "knowledge_base_built", operation="rebuild", chunks=indexed, mi_id=mi_id or "all")

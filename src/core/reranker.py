@@ -6,6 +6,8 @@ import logging
 import re
 from typing import Any
 
+from langchain_core.documents import Document
+
 from src.config import Settings
 from src.utils.logging import log_event
 
@@ -38,19 +40,41 @@ class Reranker:
         text_terms = set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
         return len(query_terms & text_terms) / max(len(query_terms), 1)
 
-    def rerank(self, query: str, candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    def rerank(self, query: str, candidates: list[Any], limit: int) -> list[Any]:
+        """Rerank candidates (Document or dict) and return the top results."""
         if not candidates:
             return []
+
+        first = candidates[0]
+        is_doc = isinstance(first, Document)
+
+        pairs = []
+        for item in candidates:
+            if isinstance(item, Document):
+                text = item.page_content
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("page_content", "")
+            else:
+                text = str(item)
+            pairs.append((query, text))
+
         if self.model is not None:
-            pairs = [(query, candidate["text"]) for candidate in candidates]
             scores = self.model.predict(pairs)
-            ranked = [
-                {**candidate, "rerank_score": float(score)}
-                for candidate, score in zip(candidates, scores)
-            ]
         else:
-            ranked = [
-                {**candidate, "rerank_score": self._lexical_score(query, candidate["text"])}
-                for candidate in candidates
-            ]
-        return sorted(ranked, key=lambda item: item["rerank_score"], reverse=True)[:limit]
+            scores = [self._lexical_score(query, text) for _, text in pairs]
+
+        for item, score in zip(candidates, scores):
+            s = float(score)
+            if isinstance(item, Document):
+                item.metadata["rerank_score"] = s
+            elif isinstance(item, dict):
+                item["rerank_score"] = s
+
+        def _score(item: Any) -> float:
+            if isinstance(item, Document):
+                return float(item.metadata.get("rerank_score", 0))
+            if isinstance(item, dict):
+                return float(item.get("rerank_score", 0))
+            return 0.0
+
+        return sorted(candidates, key=_score, reverse=True)[:limit]

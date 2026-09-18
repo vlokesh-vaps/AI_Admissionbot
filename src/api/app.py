@@ -27,7 +27,7 @@ from src.core.conversation import ConversationStore
 from src.core.rag import AdmissionRAG
 from src.core.reranker import Reranker
 from src.core.retrievers import HybridRetriever
-from src.ingestion.chunking import chunk_document
+from src.ingestion.chunking import chunk_documents
 from src.ingestion.loaders import SUPPORTED_EXTENSIONS, load_document
 from src.storage.cache import ResponseCache
 from src.storage.vector_db import VectorStore
@@ -210,8 +210,8 @@ async def upload_admission_document(
     destination.write_bytes(data)
 
     try:
-        document = load_document(destination)
-        chunks = chunk_document(document, mi_id=mi_id_clean)
+        documents = load_document(destination)
+        chunks = chunk_documents(documents, mi_id=mi_id_clean)
         indexed = store.upsert(chunks, mi_id=mi_id_clean)
         retriever.refresh()
     except Exception as exc:

@@ -1,28 +1,18 @@
-"""Hybrid keyword and semantic retrieval with mandatory multi-tenant MI_ID isolation."""
+"""Hybrid keyword and semantic retrieval using LangChain EnsembleRetriever with MI_ID isolation."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
 import re
 
+from collections.abc import Sequence
 try:
-    from rank_bm25 import BM25Okapi
-except ImportError:
-    class BM25Okapi:  # type: ignore[no-redef]
-        def __init__(self, corpus: list[list[str]]) -> None:
-            self.corpus = corpus
+    from langchain.retrievers import EnsembleRetriever
+except (ImportError, ModuleNotFoundError):
+    from langchain_classic.retrievers import EnsembleRetriever
 
-        def get_scores(self, query_tokens: list[str]) -> list[float]:
-            scores: list[float] = []
-            q_set = set(query_tokens)
-            for doc in self.corpus:
-                if not doc:
-                    scores.append(0.0)
-                    continue
-                match_count = sum(1 for token in doc if token in q_set)
-                scores.append(float(match_count) / len(doc))
-            return scores
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
+from qdrant_client import models
 
 from src.config import Settings
 from src.storage.vector_db import VectorStore
@@ -43,84 +33,76 @@ def _normalize(values: Sequence[float]) -> list[float]:
 
 
 class HybridRetriever:
-    """Retrieve candidates from semantic (Qdrant) and BM25 indexes with strict tenant isolation."""
+    """Retrieve candidates using LangChain's EnsembleRetriever (Qdrant + BM25) with strict tenant isolation."""
 
     def __init__(self, store: VectorStore, settings: Settings) -> None:
         self.store = store
         self.settings = settings
-        self._chunks: list[dict[str, Any]] = []
+        self._docs: list[Document] = []
         self.refresh()
 
     def refresh(self) -> None:
         """Reload all chunks from the vector store."""
-        self._chunks = self.store.all_chunks()
+        self._docs = self.store.all_chunks()
 
     def search(
         self,
         query: str,
         mi_id: str | int,
         limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """Search strictly within the specified tenant MI_ID."""
+    ) -> list[Document]:
+        """Search strictly within the specified tenant MI_ID using EnsembleRetriever."""
         if mi_id is None or not str(mi_id).strip():
             raise ValueError("Mandatory multi-tenant parameter 'mi_id' is required for retrieval.")
 
         mi_id_str = str(mi_id).strip()
         limit = limit or self.settings.retrieval_top_k
 
-        # 1. Semantic search with mandatory MI_ID filter in Qdrant
-        semantic = self.store.search(query=query, mi_id=mi_id_str, limit=limit * 2)
-        semantic_by_id = {item["id"]: item for item in semantic}
-        if semantic:
-            semantic_scores = _normalize([float(item["score"]) for item in semantic])
-            for item, score in zip(semantic, semantic_scores):
-                semantic_by_id[item["id"]] = {**item, "score": score}
+        # 1. Create Qdrant retriever with mandatory MI_ID filter
+        tenant_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="metadata.mi_id",
+                    match=models.MatchValue(value=mi_id_str),
+                )
+            ]
+        )
+        qdrant_retriever = self.store.langchain_store.as_retriever(
+            search_kwargs={"k": limit, "filter": tenant_filter}
+        )
 
-        # 2. Filter local chunks to current tenant for BM25
-        tenant_chunks = [
-            chunk for chunk in self._chunks
-            if str(chunk.get("mi_id") or chunk.get("metadata", {}).get("mi_id", "")).strip() == mi_id_str
+        # 2. Filter local document cache to current tenant for BM25
+        tenant_docs = [
+            doc for doc in self._docs
+            if doc.metadata.get("mi_id", "").strip() == mi_id_str
         ]
 
-        # If store has new chunks not yet in cache, include semantic hits in tenant_chunks
-        known_ids = {c["id"] for c in tenant_chunks}
-        for hit in semantic:
-            if hit["id"] not in known_ids:
-                tenant_chunks.append(hit)
-                known_ids.add(hit["id"])
+        # If no tenant documents cached, fall back to Qdrant-only
+        if not tenant_docs:
+            results = qdrant_retriever.invoke(query)
+            for i, doc in enumerate(results):
+                doc.metadata.setdefault("score", 1.0 - (i / max(len(results), 1)))
+                doc.metadata["retriever"] = "semantic"
+                doc.metadata.setdefault("mi_id", mi_id_str)
+            return results[:limit]
 
-        if not tenant_chunks:
-            return semantic[:limit]
+        # 3. Create BM25 retriever from tenant documents
+        bm25_retriever = BM25Retriever.from_documents(
+            tenant_docs, k=limit, preprocess_func=_tokens
+        )
 
-        # 3. BM25 keyword scoring on tenant documents
-        tokenized_corpus = [_tokens(chunk["text"]) for chunk in tenant_chunks]
-        bm25 = BM25Okapi(tokenized_corpus)
-        query_tokens = _tokens(query)
-        keyword_scores_raw = bm25.get_scores(query_tokens)
-        keyword_scores = _normalize(keyword_scores_raw) if any(keyword_scores_raw) else [0.0] * len(tenant_chunks)
+        # 4. Ensemble with configurable weights
+        ensemble = EnsembleRetriever(
+            retrievers=[qdrant_retriever, bm25_retriever],
+            weights=[self.settings.hybrid_vector_weight, self.settings.hybrid_bm25_weight],
+        )
 
-        # 4. Fuse scores
-        candidates: dict[str, dict[str, Any]] = {}
-        for idx, chunk in enumerate(tenant_chunks):
-            chunk_id = chunk["id"]
-            semantic_score = float(semantic_by_id.get(chunk_id, {}).get("score", 0.0))
-            keyword_score = float(keyword_scores[idx]) if idx < len(keyword_scores) else 0.0
-            combined = (
-                self.settings.hybrid_vector_weight * semantic_score
-                + self.settings.hybrid_bm25_weight * keyword_score
-            )
-            if combined > 0 or semantic_score > 0:
-                candidates[chunk_id] = {
-                    **chunk,
-                    "score": combined,
-                    "semantic_score": semantic_score,
-                    "bm25_score": keyword_score,
-                    "retriever": "hybrid",
-                    "mi_id": mi_id_str,
-                }
+        results = ensemble.invoke(query)
 
-        # Fallback to semantic hits if no hybrid candidates met threshold
-        if not candidates and semantic:
-            return semantic[:limit]
+        # Assign rank-based scores and tag with retriever info
+        for i, doc in enumerate(results):
+            doc.metadata.setdefault("score", 1.0 - (i / max(len(results), 1)))
+            doc.metadata["retriever"] = "hybrid"
+            doc.metadata.setdefault("mi_id", mi_id_str)
 
-        return sorted(candidates.values(), key=lambda item: item["score"], reverse=True)[:limit]
+        return results[:limit]

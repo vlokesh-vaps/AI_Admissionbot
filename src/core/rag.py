@@ -1,27 +1,22 @@
-"""End-to-end retrieval-augmented generation service with multi-tenant isolation."""
+"""End-to-end retrieval-augmented generation service with multi-tenant isolation using LangChain."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
 import re
-import time
 from typing import Any
 
-from openai import OpenAI
+from langchain_groq import ChatGroq
 
 from src.config import Settings
 from src.core.conversation import ConversationStore
-from src.core.prompts import SYSTEM_PROMPT, build_context, build_user_prompt
+from src.core.prompts import ADMISSION_PROMPT, build_context
 from src.core.reranker import Reranker
 from src.core.retrievers import HybridRetriever
 from src.utils.logging import log_event
 
 logger = logging.getLogger(__name__)
-
-_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
-_MAX_RETRIES = 2
-_RETRY_BASE_DELAY = 1.0
 
 
 @dataclass(frozen=True)
@@ -35,7 +30,7 @@ class ChatResult:
 
 
 class AdmissionRAG:
-    """Coordinate retrieval, reranking, conversation memory, and generation."""
+    """Coordinate retrieval, reranking, conversation memory, and LLM generation."""
 
     def __init__(
         self,
@@ -48,9 +43,12 @@ class AdmissionRAG:
         self.retriever = retriever
         self.reranker = reranker
         self.conversations = conversations
-        self.client = OpenAI(
+        self.llm = ChatGroq(
             api_key=settings.groq_api_key or "missing-groq-key",
-            base_url="https://api.groq.com/openai/v1",
+            model=settings.groq_model,
+            temperature=0.1,
+            max_tokens=700,
+            max_retries=2,
             timeout=settings.groq_timeout_seconds,
         )
 
@@ -78,37 +76,22 @@ class AdmissionRAG:
             return "Applicant explicitly requested an admissions counselor."
         return None
 
-    def _call_groq(self, prompt: str) -> str:
-        """Call Groq with timeout and retry for transient errors."""
-        last_exc: Exception | None = None
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.settings.groq_model,
-                    temperature=0.1,
-                    max_tokens=700,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                if not response.choices:
-                    raise RuntimeError("Groq returned an empty response (no choices).")
-                return response.choices[0].message.content or "I could not generate an answer."
-            except Exception as exc:
-                last_exc = exc
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if status in _TRANSIENT_STATUS_CODES and attempt < _MAX_RETRIES:
-                    delay = _RETRY_BASE_DELAY * (2 ** attempt)
-                    log_event(logger, logging.WARNING, "llm_retry", operation="generate", status=status, attempt=attempt + 1, max_retries=_MAX_RETRIES, delay_ms=round(delay * 1000))
-                    time.sleep(delay)
-                    continue
-                raise
-        raise RuntimeError("Groq call failed after retries") from last_exc  # pragma: no cover
+    def _call_llm(self, context: str, history: str, question: str) -> str:
+        """Call Groq via LangChain ChatGroq with prompt template."""
+        messages = ADMISSION_PROMPT.format_messages(
+            context=context or "[No relevant knowledge-base passage was retrieved.]",
+            history=history or "[No previous conversation.]",
+            question=question,
+        )
+        response = self.llm.invoke(messages)
+        return response.content or "I could not generate an answer."
 
-    def chat( self, conversation_id: str,
+    def chat(
+        self,
+        conversation_id: str,
         question: str,
-        mi_id: str | int | None = None, ) -> ChatResult:
+        mi_id: str | int | None = None,
+    ) -> ChatResult:
         if not question.strip():
             raise ValueError("Question must not be empty.")
         if not self.settings.groq_api_key:
@@ -116,29 +99,40 @@ class AdmissionRAG:
 
         target_mi_id = str(mi_id or self.settings.default_mi_id).strip()
         conversation = self.conversations.get_or_create(f"{target_mi_id}:{conversation_id}")
+
+        # Retrieve candidates with multi-tenant isolation
         candidates = self.retriever.search(question, mi_id=target_mi_id)
+
+        # Rerank using cross-encoder or lexical fallback
         ranked = self.reranker.rerank(question, candidates, self.settings.rerank_top_k)
+
+        # Build context and call LLM via LangChain
         context = build_context(ranked, self.settings.max_context_chars)
-        prompt = build_user_prompt(question, context, conversation.history_text())
-        content = self._call_groq(prompt)
+        content = self._call_llm(context, conversation.history_text(), question)
+
+        # Parse structured response
         answer, escalate, reason = self._parse_response(content)
+
+        # Escalation logic
         explicit_reason = self._explicit_escalation_reason(question)
         if explicit_reason:
             escalate, reason = True, explicit_reason
         if not ranked and not reason:
             escalate, reason = True, "No supporting knowledge-base context was retrieved."
+
+        # Update conversation memory
         conversation.add_message("user", question)
         conversation.add_message("assistant", answer)
 
         sources = [
             {
-                "source": item.get("metadata", {}).get("source"),
-                "title": item.get("metadata", {}).get("title"),
-                "chunk_index": item.get("metadata", {}).get("chunk_index"),
-                "score": round(float(item.get("rerank_score", item.get("score", 0))), 4),
+                "source": doc.metadata.get("source"),
+                "title": doc.metadata.get("title"),
+                "chunk_index": doc.metadata.get("chunk_index"),
+                "score": round(float(doc.metadata.get("rerank_score", doc.metadata.get("score", 0))), 4),
                 "mi_id": target_mi_id,
             }
-            for item in ranked
+            for doc in ranked
         ]
         log_event(
             logger,

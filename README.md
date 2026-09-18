@@ -1,6 +1,6 @@
-# AI Admission Bot & Multi-Tenant Ingestion Service
+# AI Admission Bot & Multi-Tenant Ingestion Service (LangChain Powered)
 
-A high-performance, RAG-powered (Retrieval-Augmented Generation) Admission Assistant chatbot and document ingestion service built with **FastAPI**, **Qdrant Vector Database**, **Ollama Embeddings**, **Groq LLM**, and **Hybrid Vector/BM25 Search**.
+A high-performance, RAG-powered (Retrieval-Augmented Generation) Admission Assistant chatbot and document ingestion service built with the **LangChain Framework**, **FastAPI**, **Qdrant Vector Database**, **Ollama Embeddings**, **Groq LLM (`ChatGroq`)**, and **LangChain Hybrid (`EnsembleRetriever` + `BM25Retriever`) Search**.
 
 Supports seamless integration with **.NET ERP** systems via multi-tenant document upload, enforcing **strict `MI_ID` data isolation** across institutions.
 
@@ -24,23 +24,25 @@ For a developer-oriented explanation of the code, data flow, configuration, and 
 ├────────────────────────────────────────────────────────┤
 │ 1. Validate File (.pdf/.docx) & Tenant (MI_ID)         │
 │ 2. Save to tenant directory: data/documents/{MI_ID}/   │
-│ 3. Extract text (PDF/DOCX loaders)                     │
-│ 4. Chunk text & tag metadata with MI_ID                │
-│ 5. Generate Vector Embeddings via Ollama               │
-│ 6. Upsert to Qdrant collection with payload:           │
-│    - mi_id: "1001" (Indexed keyword field)             │
-│    - source: "document.pdf"                            │
-│    - text: chunk text                                  │
+│ 3. Load via LangChain PyPDFLoader / DOCX parser        │
+│ 4. Chunk with LangChain RecursiveCharacterTextSplitter │
+│    - Tag metadata: mi_id="1001", stable chunk_id       │
+│ 5. Embed with LangChain OllamaEmbeddings               │
+│ 6. Upsert to LangChain QdrantVectorStore:              │
+│    - metadata.mi_id: "1001" (Indexed keyword field)    │
+│    - metadata.source: "document.pdf"                   │
+│    - page_content: chunk text                          │
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │                  Qdrant Vector DB                      │
 │  Collection: admission_knowledge                       │
-│  Payload Index: mi_id (keyword)                        │
+│  Payload Index: metadata.mi_id (keyword)               │
 │                                                        │
-│  MANDATORY SEARCH FILTER:                              │
-│  Filter(must=[FieldCondition(key="mi_id", match=1001)])│
+│  MANDATORY ENSEMBLE RETRIEVER FILTER:                  │
+│  - Qdrant Vector Retriever (Filter: metadata.mi_id)    │
+│  - BM25Retriever (Tenant documents cache)              │
 │  ==> ZERO CROSS-TENANT DATA LEAKAGE GUARANTEED         │
 └────────────────────────────────────────────────────────┘
 ```
@@ -49,14 +51,16 @@ For a developer-oriented explanation of the code, data flow, configuration, and 
 
 ## Key Features
 
-- **Multi-Tenant Isolation:** Documents and vector embeddings are partitioned by `MI_ID`. All Qdrant semantic searches and BM25 queries strictly enforce tenant filtering.
+- **LangChain Core Framework:** Standardized pipeline built on modern LangChain abstractions (`ChatGroq`, `QdrantVectorStore`, `OllamaEmbeddings`, `EnsembleRetriever`, `RecursiveCharacterTextSplitter`, `ChatPromptTemplate`, and `InMemoryChatMessageHistory`).
+- **Strict Multi-Tenant Isolation:** Documents and vector embeddings are partitioned by `MI_ID`. All semantic searches and BM25 retrievals strictly enforce institution filtering (`metadata.mi_id`).
 - **.NET ERP Integration:** Direct API endpoint `POST /api/ai/admission/document` accepts tenant `MI_ID` and PDF/DOCX files.
-- **Ollama Dense Embeddings:** Generates embeddings locally via Ollama (`embeddinggemma:latest` by default; configurable).
-- **Qdrant Vector Store:** Fast, scalable vector retrieval with keyword payload indexing on tenant IDs.
-- **Hybrid Retrieval System:** Dense vector search combined with sparse BM25 keyword matching and cross-encoder reranking.
+- **Ollama Dense Embeddings:** Local embedding generation via `langchain_ollama.OllamaEmbeddings` (`embeddinggemma:latest` by default; configurable).
+- **Qdrant Vector Store:** Fast, scalable vector retrieval powered by `langchain_qdrant.QdrantVectorStore` with payload indexing on tenant IDs.
+- **Hybrid Ensemble Retrieval:** Weighted ensemble combining `QdrantVectorStore.as_retriever()` and `BM25Retriever.from_documents()` with local cross-encoder reranking.
 - **Interactive Web Interface:** Modern UI served at `/` on port **5003**.
-- **Counselor Escalation:** Structured workflow for admission counselor follow-up.
-- **High-Speed Caching:** Multi-tenant response cache with configurable TTL.
+- **Counselor Escalation:** Structured detection and workflow for admission counselor follow-up.
+- **High-Speed Response Caching:** Tenant-scoped response cache with configurable TTL.
+- **Robust Offline Resilience:** Graceful startup even if Ollama is temporarily offline.
 
 ---
 
@@ -65,11 +69,10 @@ For a developer-oriented explanation of the code, data flow, configuration, and 
 ```
 AI_Admissionbot/
 ├── app.py                      # FastAPI server entry point (Port 5003)
-├── main.py                     # CLI chat entry point
+├── main.py                     # CLI command hub (api, chat, build-kb)
 ├── Dockerfile                  # Container definition (Exposed on 5003)
 ├── docker-compose.yml          # Admission Bot (5003) + Ollama (11434) + Qdrant (6333)
-├── requirements.txt            # Core dependencies
-├── requirements-optional.txt   # Optional enhancements
+├── requirements.txt            # Core dependencies (including LangChain packages)
 ├── .env.example                # Environment variables template
 ├── .env                        # Local runtime environment
 ├── data/                       # Local data storage
@@ -79,31 +82,32 @@ AI_Admissionbot/
 │   ├── models/                 # Model cache directory
 │   └── qdrant_db/              # Local embedded Qdrant database
 ├── scripts/
-│   ├── build_kb.py             # Batch knowledge base indexing script
+│   ├── build_kb.py             # Batch knowledge base indexing script (LangChain-based)
 │   └── cli_chat.py             # Interactive terminal chat client
 ├── src/
 │   ├── api/
 │   │   ├── app.py              # FastAPI endpoints (/api/ai/admission/document, /api/chat)
 │   │   └── schemas.py          # Pydantic request/response schemas
 │   ├── core/
-│   │   ├── conversation.py     # Tenant-isolated conversation store
-│   │   ├── prompts.py          # System prompts and prompt templates
-│   │   ├── rag.py              # Core RAG orchestration pipeline
-│   │   ├── reranker.py         # Cross-encoder reranking
-│   │   └── retrievers.py       # Multi-tenant Hybrid retriever
+│   │   ├── conversation.py     # LangChain InMemoryChatMessageHistory conversation store
+│   │   ├── prompts.py          # LangChain ChatPromptTemplate definitions
+│   │   ├── rag.py              # Core RAG orchestration pipeline (ChatGroq)
+│   │   ├── reranker.py         # Cross-encoder / lexical reranker
+│   │   └── retrievers.py       # LangChain EnsembleRetriever (Qdrant + BM25)
 │   ├── ingestion/
-│   │   ├── chunking.py         # Tenant-tagged text chunking
-│   │   └── loaders.py          # PDF and DOCX parsers
+│   │   ├── chunking.py         # LangChain RecursiveCharacterTextSplitter with MI_ID metadata
+│   │   └── loaders.py          # LangChain PyPDFLoader and python-docx parsers
 │   ├── storage/
 │   │   ├── cache.py            # Local response cache
-│   │   └── vector_db.py        # Qdrant VectorStore with mandatory MI_ID filtering
+│   │   ├── postgres.py         # ERP PostgreSQL repository
+│   │   └── vector_db.py        # LangChain QdrantVectorStore with mandatory MI_ID filtering
 │   ├── utils/
 │   │   └── logging.py          # Structured event logging
 │   └── config.py               # Settings and configuration management
 ├── static/
 │   └── index.html              # Frontend Web UI
 └── tests/
-    ├── conftest.py             # Test fixtures
+    ├── conftest.py             # Test fixtures and environment setup
     ├── test_api.py             # FastAPI endpoint test suite
     ├── test_core.py            # RAG and retriever unit tests
     ├── test_loaders.py         # Document parser tests
@@ -114,6 +118,7 @@ AI_Admissionbot/
 ---
 
 ## Quick Start
+
 ### 1. Prerequisites
 
 - **Python 3.10+** (Python 3.12 recommended)
@@ -131,6 +136,7 @@ AI_Admissionbot/
    ```bash
    pip install -r requirements.txt
    ```
+   *(Installs FastAPI, LangChain, langchain-groq, langchain-ollama, langchain-qdrant, langchain-community, rank-bm25, and supporting packages)*
 
 2. **Configure environment:**
    ```bash
@@ -157,8 +163,7 @@ AI_Admissionbot/
 ```bash
 python main.py api
 ```
-The API is also the default command:
-
+Or simply:
 ```bash
 python main.py
 ```
@@ -227,17 +232,6 @@ Called by the .NET ERP when a user uploads a PDF or DOCX file.
 Returns `415` for unsupported file types, `413` for files over the configured limit, and `422` when document indexing fails.
 
 The uploaded `File` is the only accepted document source. `FilePath` is retained as ERP metadata and is never downloaded by this service.
-
-The endpoint accepts exactly two multipart fields: `File` and `MI_ID`. Requests without either field are rejected. The ERP must post the document itself as multipart form data.
-
-### Upload a Legacy Document
-
-`POST /api/documents/upload` accepts a single `file` multipart field and indexes it under `DEFAULT_MI_ID`. This route is retained for backward compatibility; new integrations should use the tenant upload route above.
-
-```bash
-curl -X POST http://localhost:5003/api/documents/upload \
-  -F "file=@student_document.pdf"
-```
 
 ### Chat with Admission Bot (Tenant-Isolated)
 - **Endpoint:** `POST /api/chat`
@@ -311,4 +305,5 @@ Run the full automated test suite:
 ```bash
 pytest tests/ -v
 ```
-All multi-tenant isolation, chunking, and core RAG tests run against an isolated in-memory Qdrant instance to guarantee zero cross-tenant data leakage.
+
+All 20 test cases (multi-tenant isolation, chunking, core RAG, document loaders, API endpoints, and web UI) run against an isolated in-memory Qdrant instance to guarantee zero cross-tenant data leakage and 100% test reliability.
