@@ -14,7 +14,7 @@ The core technology stack consists of:
 - **Embeddings:** Ollama (`OllamaEmbeddings` with `embeddinggemma:latest`)
 - **Hybrid Retrieval:** LangChain `EnsembleRetriever` combining dense vector search and `BM25Retriever`
 - **Reranking:** CrossEncoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) with lexical fallback
-- **Database:** PostgreSQL (ERP database integration for chat messages)
+- **Vector DB:** Qdrant with tenant isolation via `metadata.mi_id` and document active filtering via `metadata.is_active`
 
 ---
 
@@ -29,12 +29,12 @@ File=document.pdf
 ```
 
 1. **Validation:** The service validates the tenant `MI_ID` and checks the file extension (`.pdf` or `.docx`).
-2. **Storage:** The raw file is saved under `data/documents/<MI_ID>/`.
+2. **In-Memory / Temp Processing:** The file is streamed to a temporary file, extracted, and unlinked immediately. No raw files are permanently stored on local disk.
 3. **Loading:** LangChain `PyPDFLoader` (or `python-docx`) extracts text and metadata into a `LoadedDocument(Document)`.
-4. **Chunking:** LangChain `RecursiveCharacterTextSplitter` segments the document into `DocumentChunk(Document)` instances tagged with `metadata.mi_id` and a stable, deterministic chunk hash.
-5. **Embedding & Storage:** LangChain `QdrantVectorStore` persists document chunks and indexes the `metadata.mi_id` payload field for zero cross-tenant leakage.
+4. **Chunking:** LangChain `RecursiveCharacterTextSplitter` segments the document into `DocumentChunk(Document)` instances tagged with `metadata.mi_id`, `metadata.is_active = true`, and a stable, deterministic chunk hash.
+5. **Embedding & Storage:** LangChain `QdrantVectorStore` persists document chunks, auto-creating the `admission_knowledge` collection if needed, and indexes the `metadata.mi_id` payload field for zero cross-tenant leakage.
 
-The upload endpoint accepts exactly `File` and `MI_ID`. The uploaded `File` is the only accepted document source. `FilePath` is not used or downloaded. Requests without `File` are rejected.
+The upload endpoint accepts `File` and `MI_ID`. Requests without `File` or `MI_ID` are rejected.
 
 ---
 
@@ -48,40 +48,9 @@ The upload endpoint accepts exactly `File` and `MI_ID`. The uploaded `File` is t
 4. **Context Construction:** Top reranked passages are formatted into structured citations.
 5. **Generation via ChatGroq:** `ChatPromptTemplate` compiles the system prompt, retrieved context, conversation history, and user query into messages for `ChatGroq`.
 6. **Structured Parsing & Escalation:** The response is parsed for `ANSWER`, `ESCALATE`, and `REASON`. Counselor escalation is triggered automatically if the query explicitly asks for a counselor or if context is missing.
-7. **Memory & Persistence:**
-   - Active memory is recorded via `InMemoryChatMessageHistory`.
-   - Message turns are archived to the ERP `AI_Admission_Conversation` PostgreSQL table if configured.
+7. **Memory:** Active session turns are maintained in-memory via `InMemoryChatMessageHistory`. Responses are cached locally in `ResponseCache`.
 
-Every retrieval operation strictly enforces the requested `MI_ID` to guarantee institution-level multi-tenant isolation.
-
----
-
-## Database Tables
-
-The service integrates with existing ERP tables and does not create tables automatically.
-
-### `AI_Admission_Document`
-
-The repository reads `AID_Id`, `MI_ID`, `FileName`, `FilePath`, and `ActiveFlag`. Rows are selected by `AID_Id`, `MI_ID`, and `ActiveFlag = true`. The posted file is processed; `FilePath` is not used as a download source.
-
-### `AI_Admission_Conversation`
-
-The service inserts `MI_ID`, `Session_id`, `Message`, `CreatedBy`, `CreatedDate`, and `ActiveFlag`.
-
-Each chat turn creates one row containing both messages. The `Message` value is a JSON array containing only the role and message content:
-
-```json
-[
-  {
-    "role": "user",
-    "content": "What is the admission fee?"
-  },
-  {
-    "role": "assistant",
-    "content": "The admission fee is ..."
-  }
-]
-```
+Every retrieval operation strictly enforces the requested `MI_ID` and `metadata.is_active == True` to guarantee institution-level multi-tenant isolation.
 
 ---
 
@@ -93,7 +62,6 @@ main.py                   Unified CLI entry point (api, chat, build-kb)
 src/config.py             Environment-backed settings
 src/api/app.py            Routes and request orchestration
 src/api/schemas.py        Pydantic request and response models
-src/storage/postgres.py   ERP PostgreSQL access
 src/storage/vector_db.py  LangChain QdrantVectorStore & OllamaEmbeddings access
 src/storage/cache.py      File-backed response cache
 src/ingestion/loaders.py  LangChain PyPDFLoader and python-docx extraction (LoadedDocument)
@@ -115,10 +83,10 @@ tests/                    Automated tests (pytest)
 
 Multi-tenant isolation is enforced at every layer of the architecture:
 
-1. **API receives and sanitizes `mi_id`:**
+1. **API requires and sanitizes `mi_id`:**
    ```python
    # src/api/app.py
-   target_mi_id = str(request.mi_id or settings.default_mi_id).strip()
+    target_mi_id = str(request.mi_id).strip()
    ```
 
 2. **RAG pipeline binds conversation and retrieval to `mi_id`:**
@@ -190,9 +158,7 @@ OLLAMA_HOST=http://localhost:11434
 OLLAMA_EMBED_MODEL=embeddinggemma:latest
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=admission_knowledge
-DEFAULT_MI_ID=1001
-DATABASE_URL=postgresql://username:password@host:5432/database?sslmode=require
-DATABASE_CREATED_BY=0
+QDRANT_ALLOW_IN_MEMORY=false
 ```
 
 Never commit `.env` or place credentials in source code or documentation.

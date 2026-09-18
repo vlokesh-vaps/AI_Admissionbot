@@ -3,15 +3,41 @@
 from __future__ import annotations
 
 from typing import Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ChatRequest(BaseModel):
     """Payload for submitting an applicant admission question."""
 
-    conversation_id: str = Field(default="demo-conversation", description="Conversation ID")
-    question: str = Field(..., min_length=1, description="Applicant question")
-    mi_id: str | None = Field(default=None, description="Tenant unique identifier (MI_ID)")
+    conversation_id: str = Field(..., min_length=1, max_length=128, description="Conversation ID")
+    question: str = Field(..., min_length=1, max_length=4000, description="Applicant question")
+    mi_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$", description="Tenant unique identifier (MI_ID)")
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_keys(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Normalize conversation_id / session_id / Session_id
+            if "conversation_id" not in data:
+                for k in ("Session_id", "session_id", "Conversation_id", "ConversationId"):
+                    if k in data and data[k]:
+                        data["conversation_id"] = str(data[k])
+                        break
+            # Normalize mi_id / MI_ID
+            if "mi_id" not in data:
+                for k in ("MI_ID", "miId", "tenant_id", "TenantId"):
+                    if k in data and data[k] is not None:
+                        data["mi_id"] = str(data[k])
+                        break
+            # Normalize question / Question / message / Message
+            if "question" not in data:
+                for k in ("Question", "message", "Message", "query", "Query"):
+                    if k in data and data[k]:
+                        data["question"] = str(data[k])
+                        break
+        return data
 
 
 class SourceReference(BaseModel):
@@ -64,15 +90,6 @@ class KnowledgeBaseStatus(BaseModel):
     mi_id: str | None = None
 
 
-class UploadResponse(BaseModel):
-    """Result returned when a new document is uploaded and indexed."""
-
-    filename: str
-    stored_path: str
-    indexed_chunks: int
-    mi_id: str | None = None
-
-
 class TenantDocumentUploadResponse(BaseModel):
     """Result returned when a document is uploaded for a specific tenant from the .NET ERP."""
 
@@ -85,3 +102,43 @@ class TenantDocumentUploadResponse(BaseModel):
         default="Document successfully processed and indexed into tenant knowledge base.",
         description="Informational message",
     )
+
+
+class DocumentActiveRequest(BaseModel):
+    """Payload to activate or deactivate a document for a tenant."""
+
+    MI_ID: str = Field(..., pattern=r"^[A-Za-z0-9_-]+$", description="Tenant unique identifier (e.g. 30)")
+    FileName: str = Field(..., description="Document filename (e.g. Pre_Admission_Module_Knowledge_Base.pdf)")
+    ActiveFlag: bool = Field(..., description="Active status flag (true = active, false = inactive)")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DocumentActiveResponse(BaseModel):
+    """Result returned after toggling active status of a document."""
+
+    status: str = Field(default="success")
+    mi_id: str
+    filename: str
+    is_active: bool
+    updated_chunks: int
+    message: str
+
+
+class DocumentDeleteRequest(BaseModel):
+    """Payload to delete a document and its vectors for a tenant."""
+
+    MI_ID: str = Field(..., pattern=r"^[A-Za-z0-9_-]+$", description="Tenant unique identifier (e.g. 30)")
+    FileName: str = Field(default="ALL", description="Document filename to delete, or 'ALL' to delete all documents for this tenant")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DocumentDeleteResponse(BaseModel):
+    """Result returned after deleting a document."""
+
+    status: str = Field(default="success")
+    mi_id: str
+    filename: str
+    deleted_chunks: int
+    message: str

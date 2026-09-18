@@ -158,7 +158,7 @@ def test_api_upload_admission_document_endpoint():
     )]
 
     with patch("src.api.app.load_document", return_value=mock_docs) as mock_load, patch("src.api.app.store") as mock_store:
-        mock_store.upsert.return_value = 2
+        mock_store.replace_document.return_value = 2
 
         response = client.post(
             "/api/ai/admission/document",

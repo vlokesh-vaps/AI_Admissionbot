@@ -4,23 +4,29 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+import tempfile
 from uuid import uuid4
 import logging
+import re
 import time
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from src.api.schemas import (
     ChatRequest,
     ChatResponse,
+    DocumentActiveRequest,
+    DocumentActiveResponse,
+    DocumentDeleteRequest,
+    DocumentDeleteResponse,
     EscalationRequest,
     EscalationResponse,
     KnowledgeBaseStatus,
     SourceReference,
     TenantDocumentUploadResponse,
-    UploadResponse,
 )
 from src.config import settings
 from src.core.conversation import ConversationStore
@@ -48,7 +54,9 @@ erp = PostgresRepository(settings)
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """Log service configuration on startup."""
+    """Ensure collection exists and log service configuration on startup."""
+    store.ensure_collection()
+
     log_event(
         logger, logging.INFO, "service_started",
         groq_model=settings.groq_model,
@@ -72,7 +80,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.allowed_origins),
-    allow_credentials=True,
+    allow_credentials="*" not in settings.allowed_origins,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
@@ -102,6 +110,14 @@ async def request_logging(request: Request, call_next):
         reset_request_id(token)
 
 _MAX_UPLOAD_BYTES = settings.max_upload_mb * 1024 * 1024
+_TENANT_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _clean_tenant_id(value: str) -> str:
+    tenant_id = str(value).strip()
+    if not _TENANT_ID.fullmatch(tenant_id):
+        raise HTTPException(status_code=422, detail="MI_ID must contain only letters, numbers, '_' or '-'.")
+    return tenant_id
 
 
 @app.exception_handler(Exception)
@@ -135,14 +151,23 @@ def _save_chat_message(mi_id: str, session_id: str, message: object) -> None:
     if not settings.database_url:
         return
     try:
-        erp.save_message(int(mi_id), session_id, message)
-    except Exception:
-        log_event(logger, logging.ERROR, "conversation_save_failed", operation="insert", table="AI_Admission_Conversation", mi_id=mi_id, session_id=session_id, error_type="database_error", exc_info=True)
-        raise RuntimeError("AI_Admission_Conversation insert failed.") from None
+        erp.save_message(mi_id, session_id, message)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "conversation_save_warning",
+            operation="insert",
+            table="AI_Admission_Conversation",
+            mi_id=mi_id,
+            session_id=session_id,
+            error_type=type(exc).__name__,
+            exc_info=True,
+        )
 
 
 def _persist_chat_turn(mi_id: str, session_id: str, question: str, answer: str) -> None:
-    """Persist one row containing the user message and assistant reply."""
+    """Persist one row containing the user query and assistant reply to PostgreSQL."""
     _save_chat_message(
         mi_id,
         session_id,
@@ -163,13 +188,28 @@ def index_ui() -> HTMLResponse:
 
 @app.get("/health")
 def health() -> dict:
-    """Deep health check including Ollama and Qdrant connectivity."""
-    store_health = store.check_health()
+    """Liveness endpoint; dependency readiness is exposed separately."""
     return {
         "status": "ok",
         "reranker_mode": reranker.mode,
-        **store_health,
+        "indexed_chunks": store.count(),
+        "persistent": not store.using_in_memory,
     }
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    """Readiness endpoint that fails when required dependencies are unavailable."""
+    store_health = store.check_health()
+    ready_state = (
+        store_health.get("qdrant") == "connected"
+        and store_health.get("ollama") == "connected"
+        and store_health.get("persistent") is True
+    )
+    return JSONResponse(
+        status_code=200 if ready_state else 503,
+        content={"status": "ready" if ready_state else "not_ready", **store_health},
+    )
 
 
 @app.post("/api/ai/admission/document", response_model=TenantDocumentUploadResponse)
@@ -182,9 +222,7 @@ async def upload_admission_document(
     Processes, chunks, embeds with Ollama, and indexes vector embeddings into
     Qdrant isolated under the specified MI_ID tenant.
     """
-    mi_id_clean = str(MI_ID).strip()
-    if not mi_id_clean:
-        raise HTTPException(status_code=422, detail="MI_ID tenant identifier is required.")
+    mi_id_clean = _clean_tenant_id(MI_ID)
 
     filename = Path(File.filename or "").name
     if not filename:
@@ -197,27 +235,47 @@ async def upload_admission_document(
             detail=f"Unsupported file format '{suffix}'. Only PDF and DOCX files are supported.",
         )
 
-    data = await File.read()
+    data = bytearray()
+    while chunk := await File.read(min(1024 * 1024, _MAX_UPLOAD_BYTES + 1 - len(data))):
+        data.extend(chunk)
+        if len(data) > _MAX_UPLOAD_BYTES:
+            break
     if len(data) > _MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,
             detail=f"File too large. Maximum upload size is {settings.max_upload_mb} MB.",
         )
 
-    # Save to tenant isolated folder: data/documents/{MI_ID}/...
-    tenant_dir = settings.tenant_documents_dir(mi_id_clean)
-    destination = tenant_dir / f"{uuid4().hex}_{filename}"
-    destination.write_bytes(data)
+    if suffix == ".pdf" and not bytes(data).lstrip().startswith(b"%PDF"):
+        raise HTTPException(status_code=415, detail="The uploaded file is not a valid PDF.")
+    if suffix == ".docx" and not bytes(data).startswith(b"PK"):
+        raise HTTPException(status_code=415, detail="The uploaded file is not a valid DOCX file.")
+
+    # Process the upload through a short-lived temporary file; raw documents are not retained.
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        tmp.write(data)
 
     try:
-        documents = load_document(destination)
-        chunks = chunk_documents(documents, mi_id=mi_id_clean)
-        indexed = store.upsert(chunks, mi_id=mi_id_clean)
-        retriever.refresh()
+        loaded = load_document(tmp_path)
+        docs = loaded if isinstance(loaded, list) else [loaded]
+        for doc in docs:
+            doc.metadata["source"] = filename
+            doc.metadata["title"] = Path(filename).stem
+        chunks = chunk_documents(docs, mi_id=mi_id_clean)
+        for chunk in chunks:
+            chunk.metadata["source"] = filename
+            chunk.metadata["title"] = Path(filename).stem
+        indexed = await run_in_threadpool(
+            store.replace_document, chunks, mi_id_clean, filename
+        )
+        await run_in_threadpool(retriever.refresh)
+        cache.clear()
     except Exception as exc:
-        destination.unlink(missing_ok=True)
         log_event(logger, logging.ERROR, "document_index_failed", operation="ingest", mi_id=mi_id_clean, filename=filename, error_type=type(exc).__name__, exc_info=True)
-        raise HTTPException(status_code=422, detail=f"Document could not be indexed: {exc}") from exc
+        raise HTTPException(status_code=422, detail="Document could not be indexed.") from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     log_event(
         logger,
@@ -226,23 +284,103 @@ async def upload_admission_document(
         mi_id=mi_id_clean,
         filename=filename,
         chunks=indexed,
-        stored_path=str(destination),
+        storage="qdrant",
     )
 
     return TenantDocumentUploadResponse(
         status="success",
         mi_id=mi_id_clean,
         filename=filename,
-        stored_path=str(destination),
+        stored_path=f"qdrant://{settings.qdrant_collection}/{mi_id_clean}/{filename}",
         indexed_chunks=indexed,
-        message="Document successfully processed and indexed into tenant knowledge base.",
+        message="Document successfully processed and indexed into Qdrant knowledge base without storing raw files on local disk.",
+    )
+
+
+@app.post("/api/ai/admission/document/active", response_model=DocumentActiveResponse)
+def toggle_document_active_status(request: DocumentActiveRequest) -> DocumentActiveResponse:
+    """Activate or deactivate all chunks of a document in Qdrant for a specific tenant."""
+    mi_id_clean = _clean_tenant_id(request.MI_ID)
+    filename_clean = Path(request.FileName).name.strip()
+    if not mi_id_clean:
+        raise HTTPException(status_code=422, detail="MI_ID is required.")
+    if not filename_clean:
+        raise HTTPException(status_code=422, detail="FileName is required.")
+
+    updated_chunks = store.set_document_active_status(
+        mi_id=mi_id_clean,
+        filename=filename_clean,
+        is_active=request.ActiveFlag,
+    )
+    retriever.refresh()
+    cache.clear()
+
+    status_str = "activated" if request.ActiveFlag else "deactivated"
+    log_event(
+        logger,
+        logging.INFO,
+        "document_status_updated",
+        mi_id=mi_id_clean,
+        filename=filename_clean,
+        is_active=request.ActiveFlag,
+        updated_chunks=updated_chunks,
+    )
+
+    return DocumentActiveResponse(
+        status="success",
+        mi_id=mi_id_clean,
+        filename=filename_clean,
+        is_active=request.ActiveFlag,
+        updated_chunks=updated_chunks,
+        message=f"Document '{filename_clean}' successfully {status_str} in Qdrant knowledge base ({updated_chunks} chunks updated).",
+    )
+
+
+@app.post("/api/ai/admission/document/delete", response_model=DocumentDeleteResponse)
+def delete_admission_document(
+    request: DocumentDeleteRequest,
+) -> DocumentDeleteResponse:
+    """Delete a document or all documents for a specific tenant in Qdrant."""
+    mi_id_clean = _clean_tenant_id(request.MI_ID)
+    filename_clean = str(request.FileName).strip()
+
+    if not mi_id_clean:
+        raise HTTPException(status_code=422, detail="MI_ID is required.")
+
+    deleted_chunks = store.delete_document(mi_id=mi_id_clean, filename=filename_clean)
+
+    # Clean up physical file on disk (both clean and legacy uuid-prefixed)
+    tenant_dir = settings.documents_dir / mi_id_clean
+    if tenant_dir.exists():
+        for p in tenant_dir.iterdir():
+            if p.is_file() and (p.name == filename_clean or p.name.endswith(f"_{filename_clean}")):
+                p.unlink(missing_ok=True)
+
+    retriever.refresh()
+    cache.clear()
+
+    log_event(
+        logger,
+        logging.INFO,
+        "document_deleted",
+        mi_id=mi_id_clean,
+        filename=filename_clean,
+        deleted_chunks=deleted_chunks,
+    )
+
+    return DocumentDeleteResponse(
+        status="success",
+        mi_id=mi_id_clean,
+        filename=filename_clean,
+        deleted_chunks=deleted_chunks,
+        message=f"Document '{filename_clean}' and its {deleted_chunks} vector chunks were successfully deleted from Qdrant.",
     )
 
 
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
     """Query the admission chatbot strictly within the applicant's tenant knowledge base."""
-    target_mi_id = str(request.mi_id or settings.default_mi_id).strip()
+    target_mi_id = _clean_tenant_id(request.mi_id)
     cache_key = f"{target_mi_id}:{request.conversation_id}"
     log_event(
         logger,

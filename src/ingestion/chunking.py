@@ -80,6 +80,8 @@ def chunk_documents(
             "mi_id": mi_id_str,
             "chunk_index": index,
             "chunk_id": chunk_id,
+            "is_active": True,
+            "active_flag": True,
         })
         if aid_id is not None:
             meta["aid_id"] = aid_id

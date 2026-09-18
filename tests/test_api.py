@@ -75,6 +75,7 @@ def test_chat_cache_hit_does_not_duplicate_cached_field() -> None:
 
     assert response.status_code == 200
     assert response.json()["cached"] is True
+    assert response.json()["answer"] == "Cached answer"
     save_message.assert_called_once()
     stored_message = save_message.call_args.args[2]
     assert stored_message == [

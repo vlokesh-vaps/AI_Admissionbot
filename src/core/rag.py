@@ -97,7 +97,9 @@ class AdmissionRAG:
         if not self.settings.groq_api_key:
             raise RuntimeError("GROQ_API_KEY is not configured.")
 
-        target_mi_id = str(mi_id or self.settings.default_mi_id).strip()
+        target_mi_id = str(mi_id or "").strip()
+        if not target_mi_id:
+            raise ValueError("mi_id is required.")
         conversation = self.conversations.get_or_create(f"{target_mi_id}:{conversation_id}")
 
         # Retrieve candidates with multi-tenant isolation

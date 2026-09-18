@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import re
-
 from collections.abc import Sequence
+
 try:
     from langchain.retrievers import EnsembleRetriever
 except (ImportError, ModuleNotFoundError):
     from langchain_classic.retrievers import EnsembleRetriever
-
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from qdrant_client import models
@@ -23,6 +22,7 @@ def _tokens(text: str) -> list[str]:
 
 
 def _normalize(values: Sequence[float]) -> list[float]:
+    """Normalize scores for callers that use the retriever utility directly."""
     if len(values) == 0:
         return []
     val_list = [float(v) for v in values]
@@ -58,23 +58,31 @@ class HybridRetriever:
         mi_id_str = str(mi_id).strip()
         limit = limit or self.settings.retrieval_top_k
 
-        # 1. Create Qdrant retriever with mandatory MI_ID filter
+        # 1. Create Qdrant retriever with mandatory MI_ID filter and excluding inactive chunks
         tenant_filter = models.Filter(
             must=[
                 models.FieldCondition(
                     key="metadata.mi_id",
                     match=models.MatchValue(value=mi_id_str),
                 )
-            ]
+            ],
+            must_not=[
+                models.FieldCondition(
+                    key="metadata.is_active",
+                    match=models.MatchValue(value=False),
+                )
+            ],
         )
         qdrant_retriever = self.store.langchain_store.as_retriever(
             search_kwargs={"k": limit, "filter": tenant_filter}
         )
 
-        # 2. Filter local document cache to current tenant for BM25
+        # 2. Filter local document cache to current tenant for BM25 (only active docs)
         tenant_docs = [
             doc for doc in self._docs
             if doc.metadata.get("mi_id", "").strip() == mi_id_str
+            and doc.metadata.get("is_active") is not False
+            and doc.metadata.get("active_flag") is not False
         ]
 
         # If no tenant documents cached, fall back to Qdrant-only

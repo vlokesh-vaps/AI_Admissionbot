@@ -71,7 +71,7 @@ AI_Admissionbot/
 ├── app.py                      # FastAPI server entry point (Port 5003)
 ├── main.py                     # CLI command hub (api, chat, build-kb)
 ├── Dockerfile                  # Container definition (Exposed on 5003)
-├── docker-compose.yml          # Admission Bot (5003) + Ollama (11434) + Qdrant (6333)
+├── docker-compose.yml          # Admission Bot (5003) + Ollama (11434); Qdrant may run externally
 ├── requirements.txt            # Core dependencies (including LangChain packages)
 ├── .env.example                # Environment variables template
 ├── .env                        # Local runtime environment
@@ -99,7 +99,6 @@ AI_Admissionbot/
 │   │   └── loaders.py          # LangChain PyPDFLoader and python-docx parsers
 │   ├── storage/
 │   │   ├── cache.py            # Local response cache
-│   │   ├── postgres.py         # ERP PostgreSQL repository
 │   │   └── vector_db.py        # LangChain QdrantVectorStore with mandatory MI_ID filtering
 │   ├── utils/
 │   │   └── logging.py          # Structured event logging
@@ -144,15 +143,12 @@ AI_Admissionbot/
    ```
    Edit `.env`:
    ```env
-   GROQ_API_KEY=gsk_your_groq_api_key_here
    PORT=5003
    OLLAMA_HOST=http://localhost:11434
    OLLAMA_EMBED_MODEL=embeddinggemma:latest
    QDRANT_URL=http://localhost:6333
    QDRANT_COLLECTION=admission_knowledge
-   DEFAULT_MI_ID=1001
-   DATABASE_URL=postgresql://username:password@host:5432/database?sslmode=require
-   DATABASE_CREATED_BY=0
+   QDRANT_ALLOW_IN_MEMORY=false
    ```
 
 ---
@@ -170,14 +166,30 @@ python main.py
 The API and Web UI will be available at:
 `http://localhost:5003`
 
-#### Option B: Run with Docker Compose
+#### Option B: Run the chatbot and Ollama with Docker Compose
 ```bash
-docker compose up --build
+docker compose up -d --build ollama
+docker compose up -d --build --no-deps admission-chatbot
 ```
 This spins up:
 - **Admission Bot API** on port `5003`
 - **Ollama Server** on port `11434`
-- **Qdrant Vector DB** on port `6333`
+
+Qdrant is a required dependency but may run as an existing external container. The chatbot must be able to resolve and reach the host configured in `QDRANT_URL`:
+
+```env
+# Use this when the existing Qdrant container is on the same Docker network.
+QDRANT_URL=http://qdrant:6333
+QDRANT_ALLOW_IN_MEMORY=false
+```
+
+If Qdrant is not on the same Docker network, connect both containers to a shared network or set `QDRANT_URL` to a reachable host address. Do not enable in-memory Qdrant in production; it loses indexed data when the chatbot container restarts.
+
+To start the bundled Qdrant service instead, run:
+
+```bash
+docker compose up -d --build
+```
 
 When changing `OLLAMA_EMBED_MODEL`, rebuild the knowledge base so all stored vectors use the same embedding model:
 
@@ -223,9 +235,9 @@ Called by the .NET ERP when a user uploads a PDF or DOCX file.
     "status": "success",
     "mi_id": "1001",
     "filename": "student_document.pdf",
-    "stored_path": "data/documents/1001/<generated-id>_student_document.pdf",
+    "stored_path": "qdrant://admission_knowledge/1001/student_document.pdf",
     "indexed_chunks": 8,
-    "message": "Document successfully processed and indexed into tenant knowledge base."
+    "message": "Document successfully processed and indexed into Qdrant knowledge base without storing raw files on local disk."
   }
   ```
 
@@ -250,7 +262,7 @@ The uploaded `File` is the only accepted document source. `FilePath` is retained
     -d "{\"conversation_id\": \"session-123\", \"question\": \"What is the fee?\", \"mi_id\": \"1001\"}"
   ```
 
-The response contains `answer`, `sources`, `escalate`, `escalation_reason`, and a `cached` flag, together with the conversation and tenant IDs. PostgreSQL stores one JSON array per chat turn containing only the user and assistant `role` and `content` values.
+The response contains `answer`, `sources`, `escalate`, `escalation_reason`, and a `cached` flag, together with the conversation and tenant IDs. Vector chunks and responses are scoped strictly to the tenant `mi_id`.
 
 ### Knowledge Base Status
 - **Endpoint:** `GET /api/knowledge-base/status?mi_id=1001`

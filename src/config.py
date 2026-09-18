@@ -33,6 +33,7 @@ class Settings:
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_api_key: str = os.getenv("QDRANT_API_KEY", "")
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "admission_knowledge")
+    allow_inmemory_qdrant: bool = _bool(os.getenv("QDRANT_ALLOW_IN_MEMORY", "false"))
     default_mi_id: str = os.getenv("DEFAULT_MI_ID", "1001")
     database_url: str = os.getenv("DATABASE_URL", "")
     database_created_by: int = int(os.getenv("DATABASE_CREATED_BY", "0"))
