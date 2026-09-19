@@ -16,11 +16,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && adduser --system --ingroup appgroup appuser
 
 COPY requirements.txt .
-# This service uses CPU inference. Install the CPU wheel first so the broad
-# torch>=2.2 requirement does not pull the multi-gigabyte CUDA runtime stack.
+# This service uses CPU inference. Install a CPU-only Torch version compatible
+# with current transformers/sentence-transformers releases. Keep this pinned
+# because the broad torch>=2.2 requirement can otherwise leave an old Torch
+# version in the image while the other ML packages continue to upgrade.
 RUN python -m pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu \
-        "torch==2.2.2" \
+        "torch==2.5.1" \
     && python -m pip install --no-cache-dir --requirement requirements.txt
 
 COPY --chown=appuser:appgroup . .
